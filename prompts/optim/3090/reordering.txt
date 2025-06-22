@@ -1,0 +1,49 @@
+# GEMM Optimizations on NVIDIA RTX 3090 GPU
+
+## 3\. Reordering Optimization
+
+**Platform-Agnostic Description:**
+Reordering refers to changing the order of operations (e.g., loop reordering) to enhance data locality, enable vectorization, and improve instruction-level parallelism. For matrix multiplication, this often means adjusting the loop nesting order.
+
+**Platform-Specific Hint (NVIDIA RTX 3090):**
+The primary reordering for GPUs is implicitly handled by the thread block and warp scheduling, but within a kernel's logic, loop reordering for the inner product can significantly impact register usage and shared memory access patterns. For GEMM $C\_{MN} = A\_{MK} \\times B\_{KN}$, the innermost loop is typically over `k` (the reduction dimension). This is good for locality on `A` (row-major) and `B` (column-major effectively for coalescing).
+
+**Implementation (Conceptual Pseudocode within a Kernel):**
+
+This optimization primarily influences the order of loops *within* a thread's computation or within the shared memory processing.
+
+```
+// Within the main GEMM kernel (after loading tiles into shared memory):
+
+// Current standard loop order for inner product (K is innermost)
+// This is generally preferred for data locality for A (row) and B (column)
+// when both are accessed sequentially by the same thread or warp.
+for (int k_inner = 0; k_inner < TILE_K; ++k_inner) {
+    // C_reg_element += shA[thread_row_idx][k_inner] * shB[k_inner][thread_col_idx];
+}
+
+// Alternative (less common for core GEMM, but illustrates reordering):
+// If you were transposing B in shared memory, or had other specific access patterns,
+// you might reorder these loops. For example, if you wanted to maximize register reuse
+// of an intermediate product.
+// However, for typical GEMM on Ampere Tensor Cores, the inner loop over K (the dot product)
+// is handled by the Tensor Cores' fixed function units, so explicit reordering of that
+// inner loop by the programmer is less about loop order and more about how fragments are
+// presented to the Tensor Cores.
+
+// High-level loop reordering (thread block level):
+// The kernel launch parameters effectively "reorder" the computation of C blocks.
+// The outer loops for `blockIdx.x` and `blockIdx.y` determine which part of C is computed.
+// This is inherent in how CUDA launches kernels.
+kernel_launch_config(gridDim(ceil(N/TILE_N), ceil(M/TILE_M)), blockDim(TILE_N_PER_BLOCK, TILE_M_PER_BLOCK));
+
+// Inside the kernel:
+// int row = blockIdx.y * TILE_M + threadIdx.y;
+// int col = blockIdx.x * TILE_N + threadIdx.x;
+// This determines *which* C[row][col] element a thread is primarily responsible for.
+// The loops within the kernel then perform the accumulation.
+```
+
+*Note:* For Tensor Cores, the "reordering" becomes less about programmer-visible loops and more about the internal instruction scheduling and data flow managed by the Tensor Core units. The programmer provides fragments, and the hardware handles the efficient multiply-accumulate sequence.
+
+-----

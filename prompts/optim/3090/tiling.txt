@@ -1,0 +1,137 @@
+# GEMM Optimizations on NVIDIA RTX 3090 GPU
+
+## 4\. Tiling Optimization
+
+**Platform-Agnostic Description:**
+Tiling (or blocking) involves breaking down large matrices into smaller sub-matrices (tiles) that fit within faster memory hierarchies (e.g., L1 cache, shared memory). This strategy significantly reduces memory bandwidth requirements and improves data reuse by keeping frequently accessed data close to the processing units.
+
+**Platform-Specific Hint (NVIDIA RTX 3090):**
+Tiling on the RTX 3090 is multi-layered:
+
+1.  **Thread Block Tiling:** A large tile of the output matrix `C` is assigned to a thread block. This tile must fit within the shared memory available to the SM.
+2.  **Warp Tiling:** Within a thread block, warps (32 threads) are assigned sub-tiles.
+3.  **Register Tiling:** Each individual thread computes a small $M\_r \\times N\_r$ sub-tile of `C` using its private registers. This is the innermost and fastest level of data reuse.
+4.  **Tensor Core Tiling (Specialized):** Tensor Cores operate on fixed-size input "fragments" (e.g., $16 \\times 16$ FP16 matrices for `A` and `B`, accumulating into $16 \\times 16$ FP32/FP16 `C` fragments). The tiling strategy needs to align with these fragment sizes.
+
+**Implementation (Conceptual CUDA C++ Kernel with Multi-Level Tiling):**
+
+This builds upon the shared memory prefetching example.
+
+```cu
+#include <cuda_runtime.h>
+#include <mma.h> // For WMMA (Tensor Cores)
+
+// Define tile dimensions based on RTX 3090 SM capabilities (shared memory, registers)
+// These are examples; optimal values depend on matrix sizes and specific Tensor Core usage.
+const int BLOCK_TILE_M = 128; // Thread block computes a 128x128 C tile
+const int BLOCK_TILE_N = 128;
+const int BLOCK_TILE_K = 16;  // K-dimension for shared memory loads
+
+// Warp-level and Register-level dimensions (for non-Tensor Core path or to structure Tensor Core calls)
+const int WARP_SIZE = 32;
+const int WARP_TILE_M = 64;   // Each warp computes a 64x64 C sub-tile (assuming 2x2 warps in a block)
+const int WARP_TILE_N = 64;
+const int THREAD_TILE_M = 8;  // Each thread computes an 8x8 C sub-tile (if not using WMMA directly for full tile)
+const int THREAD_TILE_N = 8;
+
+__global__ void gemm_tiling_kernel(float* C, const float* A, const float* B, int M, int N, int K) {
+    // Shared memory for tiles of A and B
+    // Size should be (BLOCK_TILE_M * BLOCK_TILE_K) and (BLOCK_TILE_K * BLOCK_TILE_N)
+    __shared__ float shA[BLOCK_TILE_M][BLOCK_TILE_K];
+    __shared__ float shB[BLOCK_TILE_K][BLOCK_TILE_N];
+
+    // Register accumulators for the C tile computed by this thread
+    // If using Tensor Cores, these would be nvcuda::wmma::fragment<nvcuda::wmma::accumulator,...>
+    // For simplicity, let's use a small float array for a thread's C_reg block.
+    float C_regs[THREAD_TILE_M][THREAD_TILE_N]; // Example: each thread calculates a small C block
+
+    // Initialize C_regs to zero
+    for (int i = 0; i < THREAD_TILE_M; ++i) {
+        for (int j = 0; j < THREAD_TILE_N; ++j) {
+            C_regs[i][j] = 0.0f;
+        }
+    }
+
+    // Calculate global indices for the thread's contribution to C
+    int globalBlockRow = blockIdx.y * BLOCK_TILE_M;
+    int globalBlockCol = blockIdx.x * BLOCK_TILE_N;
+
+    int threadInBlockRow = threadIdx.y;
+    int threadInBlockCol = threadIdx.x;
+
+    // Outer loop over K dimension (blocks of K)
+    for (int k_block_offset = 0; k_block_offset < K; k_block_offset += BLOCK_TILE_K) {
+        // --- Shared Memory Loading (Prefetching) ---
+        // Each thread loads a chunk of A and B into shared memory.
+        // The pattern here ensures coalesced memory access from global to shared memory.
+        // Example: load a contiguous column/row slice of A/B into shared memory
+        
+        // Coalesced load for shA (assuming A is row-major for global memory)
+        // Threads in the same row of the block (threadIdx.y) load elements for their row of shA
+        // while threads in the same column (threadIdx.x) handle columns of shA.
+        for (int i = threadInBlockRow; i < BLOCK_TILE_M; i += blockDim.y) { // Loop over rows of shared memory tile A
+            for (int j = threadInBlockCol; j < BLOCK_TILE_K; j += blockDim.x) { // Loop over columns of shared memory tile A
+                int global_A_row = globalBlockRow + i;
+                int global_A_col = k_block_offset + j;
+                if (global_A_row < M && global_A_col < K) {
+                    shA[i][j] = A[global_A_row * K + global_A_col];
+                } else {
+                    shA[i][j] = 0.0f; // Padding
+                }
+            }
+        }
+        
+        // Coalesced load for shB (assuming B is column-major effectively or transposed in shared)
+        // Similar pattern for B to ensure coalescing
+        for (int i = threadInBlockRow; i < BLOCK_TILE_K; i += blockDim.y) { // Loop over rows of shared memory tile B
+            for (int j = threadInBlockCol; j < BLOCK_TILE_N; j += blockDim.x) { // Loop over columns of shared memory tile B
+                int global_B_row = k_block_offset + i;
+                int global_B_col = globalBlockCol + j;
+                if (global_B_row < K && global_B_col < N) {
+                    shB[i][j] = B[global_B_row * N + global_B_col];
+                } else {
+                    shB[i][j] = 0.0f; // Padding
+                }
+            }
+        }
+
+        __syncthreads(); // Ensure all shared memory loads are complete
+
+        // --- Computation on Shared Memory Tiles (Warp and Register Tiling) ---
+        // Each thread processes its own small (THREAD_TILE_M x THREAD_TILE_N) region of C_regs.
+        // It fetches data from shA and shB. This is where register tiling happens.
+        // For Tensor Cores, this loop would be replaced by WMMA intrinsics.
+        for (int k_inner = 0; k_inner < BLOCK_TILE_K; ++k_inner) {
+            // For each element in C_regs:
+            for (int m_reg = 0; m_reg < THREAD_TILE_M; ++m_reg) {
+                for (int n_reg = 0; n_reg < THREAD_TILE_N; ++n_reg) {
+                    // Map threadIdx to its portion of the C block
+                    int shA_row_idx = threadInBlockRow + m_reg * (blockDim.y / THREAD_TILE_M); // Example mapping
+                    int shB_col_idx = threadInBlockCol + n_reg * (blockDim.x / THREAD_TILE_N); // Example mapping
+
+                    C_regs[m_reg][n_reg] += shA[shA_row_idx][k_inner] * shB[k_inner][shB_col_idx];
+                }
+            }
+        }
+
+        __syncthreads(); // Synchronize before next K-block iteration to ensure computation is done before new loads
+    }
+
+    // --- Store Results from Registers to Global Memory ---
+    // Each thread writes its computed C_regs block to the global C matrix.
+    for (int m_reg = 0; m_reg < THREAD_TILE_M; ++m_reg) {
+        for (int n_reg = 0; n_reg < THREAD_TILE_N; ++n_reg) {
+            int global_C_row = globalBlockRow + threadInBlockRow + m_reg * (blockDim.y / THREAD_TILE_M);
+            int global_C_col = globalBlockCol + threadInBlockCol + n_reg * (blockDim.x / THREAD_TILE_N);
+            
+            if (global_C_row < M && global_C_col < N) {
+                C[global_C_row * N + global_C_col] = C_regs[m_reg][n_reg];
+            }
+        }
+    }
+}
+```
+
+*Explanation:* This complex snippet shows the layers of tiling. Threads collaboratively load a `BLOCK_TILE_M x BLOCK_TILE_K` portion of `A` and a `BLOCK_TILE_K x BLOCK_TILE_N` portion of `B` into shared memory. Then, within the shared memory loop, each thread works on its `THREAD_TILE_M x THREAD_TILE_N` sub-block of the result, storing intermediate sums in registers (`C_regs`). The `blockDim.y / THREAD_TILE_M` and `blockDim.x / THREAD_TILE_N` terms determine how the threads are mapped to cover the overall `BLOCK_TILE_M x BLOCK_TILE_N` output block.
+
+-----

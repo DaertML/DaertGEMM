@@ -1,0 +1,4 @@
+Output format:
+write the GEMM kernel in the Python programming language, using the PyCUDA
+library. Implement a simple main in the same python file, that runs a simple
+benchmark of the generated kernel and does a validity check of the output.

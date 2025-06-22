@@ -1,0 +1,99 @@
+# GEMM Optimizations on NVIDIA RTX 3090 GPU
+
+## 5\. Vectorization Optimization
+
+**Platform-Agnostic Description:**
+Vectorization is the process of performing a single operation on multiple data elements simultaneously using specialized hardware units (e.g., SIMD units or Tensor Cores). This massively increases throughput for highly parallelizable operations like matrix multiplication by exploiting data-level parallelism.
+
+**Platform-Specific Hint (NVIDIA RTX 3090):**
+The RTX 3090, based on the Ampere architecture, primarily achieves vectorization for GEMMs through its **Tensor Cores**. These units are designed for mixed-precision matrix multiply-accumulate operations (e.g., FP16 \* FP16 + FP32 -\> FP32). For operations not using Tensor Cores (e.g., pure FP32 GEMMs), the CUDA **SIMT (Single Instruction Multiple Thread)** execution model provides implicit vectorization as warps execute the same instruction on different data, and memory accesses are **coalesced**.
+
+**Implementation (Conceptual CUDA C++ Kernel using WMMA for Tensor Cores):**
+
+This example showcases the use of the `nvcuda::wmma` API, which is the standard way to leverage Tensor Cores in CUDA C++.
+
+```cu
+#include <cuda_runtime.h>
+#include <mma.h> // Required for nvcuda::wmma namespace
+
+// Define WMMA fragment sizes (e.g., WMMMA_M, WMMA_N, WMMA_K for 16x16x16)
+// These depend on the specific Tensor Core capabilities (e.g., FP16 inputs, FP32 accumulator)
+// For Ampere, typical shapes are:
+// nvcuda::wmma::gemm_mfma_f16_16x16x16_f16_f16_f32 (16x16x16, FP16 input, FP32 output)
+// This translates to a warp processing a 16x16 C matrix using 16x16 A and 16x16 B.
+
+// Tile dimensions for the kernel, should be multiples of WMMA fragment sizes
+const int BLOCK_TILE_M = 128; // Example: 8 WMMA fragments high
+const int BLOCK_TILE_N = 128; // Example: 8 WMMA fragments wide
+const int BLOCK_TILE_K = 16;  // WMMA K is 16
+
+__global__ void gemm_tensor_core_kernel(float* C, const __half* A, const __half* B, int M, int N, int K) {
+    // Shared memory for blocks of A and B
+    // Using __half for FP16 input
+    __shared__ __half shA[BLOCK_TILE_M][BLOCK_TILE_K];
+    __shared__ __half shB[BLOCK_TILE_K][BLOCK_TILE_N];
+
+    // WMMA fragments for matrix A, B, and accumulator for C
+    // Each thread gets its own set of fragments.
+    // The sizes (16, 16, 16) refer to the WMMA operation (M, N, K)
+    // The type arguments specify data types for input and output.
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, __half, nvcuda::wmma::row_major> frag_A;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major> frag_B;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> frag_C; // Accumulate in FP32
+
+    // Initialize accumulator fragment to zero
+    nvcuda::wmma::fill_fragment(frag_C, 0.0f);
+
+    // Global indices for the thread block's contribution to C
+    int globalBlockRow = blockIdx.y * BLOCK_TILE_M;
+    int globalBlockCol = blockIdx.x * BLOCK_TILE_N;
+
+    // Loop over K dimension (similar to previous tiling, but BLOCK_TILE_K must be a multiple of WMMA_K)
+    for (int k_block_offset = 0; k_block_offset < K; k_block_offset += BLOCK_TILE_K) {
+        // --- Shared Memory Loading (Prefetching) for FP16 data ---
+        // Threads within the warp collaboratively load FP16 data into shared memory.
+        // This process is optimized for coalesced access.
+        // The implementation details for loading into shared memory will be similar
+        // to the tiling example, but casting/handling __half type.
+        // Example: (simplified for brevity)
+        // Each thread loads its assigned elements into shA/shB
+        // ... (similar shared memory loading logic as in Tiling example, but for __half)
+        
+        __syncthreads(); // Ensure shared memory is fully loaded
+
+        // --- Tensor Core Operations (Vectorization) ---
+        // Loop over the parts of the block tile that each warp will handle.
+        // A typical warp might handle a 64x64 C sub-tile (4x4 WMMA fragments).
+        // Each thread in the warp operates on its part of the fragment.
+
+        // These loops iterate over the WMMA-sized chunks within the block tile.
+        // Example: for a 128x128 block tile and 16x16 WMMA fragments, you'd have
+        // (128/16) * (128/16) = 8 * 8 = 64 WMMA operations per block.
+        // Each warp will handle a portion of these.
+        for (int warp_m = 0; warp_m < BLOCK_TILE_M; warp_m += nvcuda::wmma::MMAShape::M) { // M for WMMA fragment
+            for (int warp_n = 0; warp_n < BLOCK_TILE_N; warp_n += nvcuda::wmma::MMAShape::N) { // N for WMMA fragment
+                // Load fragments from shared memory into register-resident WMMA fragments
+                // The (shared memory) pointers and strides determine which part of shA/shB
+                // this specific thread/warp is loading for its WMMA operation.
+                nvcuda::wmma::load_matrix_sync(frag_A, shA[warp_m], BLOCK_TILE_K); // Load from shA
+                nvcuda::wmma::load_matrix_sync(frag_B, shB[0][warp_n], BLOCK_TILE_N); // Load from shB (adjust stride)
+
+                // Perform the matrix multiply-accumulate using Tensor Cores
+                nvcuda::wmma::mma_sync(frag_C, frag_A, frag_B, frag_C);
+            }
+        }
+
+        __syncthreads(); // Ensure all WMMA computations are done before shared memory is reused
+    }
+
+    // --- Store Results from Tensor Core Fragments to Global Memory ---
+    // Store the accumulated fragments (FP32) back to global memory (or convert to FP16)
+    // The store needs to be done carefully to ensure coalesced writes.
+    // Similar to loading, each thread will store its part of the C_frag.
+    // Example: (simplified for brevity)
+    // Each thread stores its assigned elements from frag_C to global C
+    nvcuda::wmma::store_matrix_sync(C + globalBlockRow * N + globalBlockCol, frag_C, N, nvcuda::wmma::mem_row_major);
+}
+```
+
+*Explanation:* This example shows how to use `nvcuda::wmma` for Tensor Core vectorization. The `load_matrix_sync` functions bring data into special Tensor Core-specific register fragments. `mma_sync` then performs the highly vectorized matrix multiplication on these fragments. This is the most efficient way to perform GEMMs on the RTX 3090 for supported data types (FP16/BF16 inputs). For pure FP32 GEMMs, the compiler will use standard SIMT execution and rely on coalesced memory access and instruction-level parallelism from the CUDA cores.

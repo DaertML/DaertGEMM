@@ -1,0 +1,79 @@
+# GEMM Optimizations on NVIDIA RTX 3090 GPU
+
+## 2\. Prefetch Optimization
+
+**Platform-Agnostic Description:**
+Prefetching aims to bring data into faster memory (like shared memory or L1 cache) *before* it's explicitly requested by compute units, thereby hiding memory latency and keeping the processing units busy. This overlaps computation with memory transfers.
+
+**Platform-Specific Hint (NVIDIA RTX 3090):**
+On the RTX 3090, the primary explicit prefetching mechanism is loading data into **shared memory**. This is programmer-managed cache that is extremely fast (much faster than L1/L2 cache for global memory). Asynchronous memory operations (`cudaMemcpyAsync`, or specialized instructions within kernels) are also key for overlapping data movement with computation.
+
+**Implementation (Conceptual CUDA C++ Kernel Snippet):**
+
+```cu
+#include <cuda_runtime.h>
+
+// Assume TILE_M, TILE_N, TILE_K are defined block dimensions
+// and register tile dimensions (e.g., WARP_M, WARP_N)
+
+__global__ void gemm_prefetch_kernel(float* C, const float* A, const float* B, int M, int N, int K) {
+    // Shared memory for blocks of A and B
+    __shared__ float sA[TILE_M][TILE_K];
+    __shared__ float sB[TILE_K][TILE_N];
+
+    // Register accumulators for the C tile computed by this thread
+    // This example uses a single float for simplicity, but in reality it's a matrix fragment
+    float C_frag = 0.0f; 
+
+    // Global indices for the thread
+    int globalRow = blockIdx.y * TILE_M + threadIdx.y;
+    int globalCol = blockIdx.x * TILE_N + threadIdx.x;
+
+    // Loop through the K dimension in blocks
+    for (int k_outer = 0; k_outer < K; k_outer += TILE_K) {
+        // Asynchronously load A and B tiles into shared memory
+        // This is done by threads within the block collaborating.
+        // Each thread calculates its specific element to load.
+
+        // Load element for sA
+        // Make sure to handle boundary conditions
+        if (globalRow < M && (k_outer + threadIdx.x) < K) { // Example: threadIdx.x for column, threadIdx.y for row
+            sA[threadIdx.y][threadIdx.x] = A[globalRow * K + (k_outer + threadIdx.x)];
+        } else {
+            sA[threadIdx.y][threadIdx.x] = 0.0f; // Pad with zeros
+        }
+
+        // Load element for sB
+        if ((k_outer + threadIdx.y) < K && globalCol < N) { // Example: threadIdx.y for row, threadIdx.x for column
+            sB[threadIdx.y][threadIdx.x] = B[(k_outer + threadIdx.y) * N + globalCol];
+        } else {
+            sB[threadIdx.y][threadIdx.x] = 0.0f; // Pad with zeros
+        }
+
+        // Synchronize threads within the block to ensure all data is loaded into shared memory
+        __syncthreads();
+
+        // Perform computation using data from shared memory
+        // This simulates a smaller matrix multiplication
+        for (int k_inner = 0; k_inner < TILE_K; ++k_inner) {
+            // Access shared memory: sA[row_in_tile][k_inner], sB[k_inner][col_in_tile]
+            // The actual computation will depend on register blocking strategy
+            C_frag += sA[threadIdx.y][k_inner] * sB[k_inner][threadIdx.x];
+        }
+
+        // Synchronize again before the next outer loop iteration to ensure
+        // all computation using the current shared memory tile is done
+        // before new data is loaded into shared memory.
+        __syncthreads();
+    }
+
+    // Write final accumulated result from register to global memory
+    if (globalRow < M && globalCol < N) {
+        C[globalRow * N + globalCol] = C_frag;
+    }
+}
+```
+
+*Key Prefetching Aspect:* The loading into `sA` and `sB` occurs in parallel for all threads in a block. While the previous `k_outer` iteration's computation is ongoing (within the `C_frag += ...` loop), the next tile's data could theoretically be preloaded by a dedicated copy engine or by clever double-buffering. The `__syncthreads()` ensures data readiness. More advanced prefetching uses **double buffering** (loading the next tile into a separate shared memory buffer while processing the current one) and **asynchronous shared memory copies** (e.g., `async_copy_global_to_shared` intrinsics on newer architectures like Ampere/Hopper for even better overlap).
+
+-----

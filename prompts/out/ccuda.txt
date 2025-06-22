@@ -1,0 +1,5 @@
+Output format:
+write the GEMM kernel in the C programming language, using the CUDA
+library. Implement a simple Makefile that will compile the generated file
+and run a benchmark and validity evaluation, so that, the user can see how
+it performs when it is built.

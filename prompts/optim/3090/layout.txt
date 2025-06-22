@@ -1,0 +1,54 @@
+# GEMM Optimizations on NVIDIA RTX 3090 GPU
+
+## 1\. Layout Optimization
+
+**Platform-Agnostic Description:**
+Optimizing data layout involves arranging matrices in memory to improve cache utilization and memory access patterns. This is crucial for minimizing data fetches from slower memory tiers and maximizing coalesced memory accesses on the GPU.
+
+**Platform-Specific Hint (NVIDIA RTX 3090):**
+On the RTX 3090, coalesced memory access is paramount. This means that threads within a warp (32 threads) accessing global memory should access contiguous memory locations. For GEMM ($C\_{MN} = A\_{MK} \\times B\_{KN}$), if `A` is row-major and `B` is column-major, inner products access contiguous elements for `A`'s rows and `B`'s columns respectively. However, the output `C` is typically written in row-major order. A common strategy for `A` and `B` is to ensure that the dimension accessed by coalesced threads is contiguous in memory.
+
+**Implementation (Pseudocode):**
+
+This isn't a "code" optimization in the sense of changing the kernel logic, but rather a best practice for how the data is *prepared* before being passed to the GPU kernel.
+
+```
+// Assuming C = A * B, where A is M x K, B is K x N, C is M x N
+
+// Option 1: Standard Row-Major Layout (most common for C/C++ arrays)
+// This is often good for A, as rows are read contiguously.
+// For B, if it's row-major, accessing columns for the inner product
+// will lead to strided access.
+function create_row_major_matrix(rows, cols):
+    allocate memory for rows * cols elements
+    return pointer to allocated memory
+
+// Option 2: Column-Major Layout
+// This can be beneficial for B, as columns will be read contiguously.
+function create_column_major_matrix(rows, cols):
+    allocate memory for rows * cols elements
+    return pointer to allocated memory
+
+// When copying data to GPU:
+// For matrix A (M x K):
+//   If A is row-major, and threads read rows, this is good.
+//   If A is column-major, and threads read columns, this is good.
+
+// For matrix B (K x N):
+//   If B is row-major, and threads read columns (for inner product), this is strided.
+//   Consider transposing B to column-major (or effectively storing it that way)
+//   if column access is frequent for coalescing.
+
+// Example of data copy to GPU with awareness of layout:
+// cudaMemcpy(dev_A, host_A, M * K * sizeof(float), cudaMemcpyHostToDevice);
+// cudaMemcpy(dev_B, host_B_transposed_if_needed, K * N * sizeof(float), cudaMemcpyHostToDevice);
+// cudaMemcpy(dev_C, host_C, M * N * sizeof(float), cudaMemcpyHostToDevice);
+
+// Within the kernel, ensure memory accesses are coalesced based on the chosen layout.
+// For example, if A is row-major:
+// Each thread loads A[row][col] where 'row' is shared among threads and 'col' varies for coalescing.
+// Or, if B is column-major:
+// Each thread loads B[row][col] where 'col' is shared among threads and 'row' varies for coalescing.
+```
+
+-----
