@@ -1,6 +1,8 @@
 # DaertGEMM
 Open source implementation of the QiMeng-GEMM: https://ojs.aaai.org/index.php/AAAI/article/view/34461/36616
 
+![alt text](llamaopt.webp "Llama kernel opt")
+
 # Introduction
 WIP Implementation! Yet lots of work are pending, somehow the base ideas are there. With this, DaertML looks forward completing as an Open Source ecosystem the ideas from the QiMeng works that have been recently published (and most of them Open Sourced) https://qimeng-ict.github.io/
 
